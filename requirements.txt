@@ -1,0 +1,10 @@
+ipython>=7.0
+cloudpickle
+
+# Testing
+pandas # For DataFrame testing
+numpy # Dependency for pandas and testing
+matplotlib # For testing display hooks
+Pillow # Dependency for matplotlib
+pytest
+pytest-asyncio 
