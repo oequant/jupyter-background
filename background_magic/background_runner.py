@@ -5,7 +5,7 @@ import os
 import io
 import uuid
 import traceback
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Manager
 from io import StringIO
 import contextlib
 import cloudpickle
@@ -53,7 +53,25 @@ class QueueDisplayPublisher:
         # Basic implementation: treat update as new display for simplicity
     #     self.publish(data, metadata=metadata)
 
-def run_code_in_background(code_str: str, output_queue: Queue, task_id: str, serialized_context: bytes | None):
+def is_module_or_unpicklable(obj):
+    """Check if an object is a module or otherwise likely to be unpicklable."""
+    # Check if it's a module
+    if isinstance(obj, type(sys)):
+        return True
+    
+    # Check if it has module-like attributes
+    if hasattr(obj, '__name__') and hasattr(obj, '__spec__') and hasattr(obj, '__package__'):
+        return True
+    
+    # Check if it's a function that refers to modules
+    if callable(obj) and hasattr(obj, '__module__') and obj.__module__ in sys.modules:
+        # Functions defined in modules should be fine with cloudpickle, but
+        # check if it contains references to sys or other known problematic modules
+        return False
+        
+    return False
+
+def run_code_in_background(code_str: str, output_queue: Queue, task_id: str, serialized_context: bytes | None, result_dict=None):
     """Executes code, capturing stdout/stderr and display outputs."""
     # --- Initialize execution context ---
     exec_globals = globals().copy()
@@ -69,6 +87,51 @@ def run_code_in_background(code_str: str, output_queue: Queue, task_id: str, ser
             return
     elif serialized_context is None:
          output_queue.put(("stderr", task_id, "[Warning] Global context serialization failed, running without it.\n"))
+
+    # --- Identify explicitly assigned variables ---
+    # Simple parsing to find variable assignments in the code
+    explicit_vars = set()
+    loop_vars = set()
+    
+    # Define important variables that should be included if they exist
+    important_vars = ['res', 'result', 'i', 'df', 'data']
+    
+    for line in code_str.split('\n'):
+        line = line.strip()
+        # Skip comments and empty lines
+        if not line or line.startswith('#'):
+            continue
+            
+        # Look for assignments (=) not in conditionals/loops
+        if '=' in line and not line.startswith(('if ', 'for ', 'while ', 'def ', 'class ')):
+            # Handle multi-assignments: x, y = 1, 2
+            var_part = line.split('=')[0].strip()
+            
+            # Handle list/tuple assignments with comma separators
+            for name in var_part.split(','):
+                name = name.strip()
+                if name and name.isidentifier():
+                    explicit_vars.add(name)
+                    
+        # Also look for append operations on lists: res.append(i)
+        elif '.append(' in line:
+            parts = line.split('.append(')
+            if parts and parts[0].strip().isidentifier():
+                explicit_vars.add(parts[0].strip())
+                
+        # Also capture for loop variables: for i in range(5)
+        elif line.startswith('for ') and ' in ' in line:
+            var_part = line[4:].split(' in ')[0].strip()
+            for name in var_part.split(','):
+                name = name.strip()
+                if name and name.isidentifier():
+                    loop_vars.add(name)
+    
+    # Add loop variables to explicit vars
+    explicit_vars.update(loop_vars)
+    
+    if explicit_vars:
+        output_queue.put(("stderr", task_id, f"[Debug] Detected variable assignments: {', '.join(explicit_vars)}\n"))
 
     # --- Setup output redirection AND display hook ---
     stdout_stream = QueueStream(output_queue, task_id, 'stdout')
@@ -274,9 +337,121 @@ def run_code_in_background(code_str: str, output_queue: Queue, task_id: str, ser
 
     try:
         output_queue.put(("status", task_id, "running"))
+        
+        # Store initial variable keys to track new or modified variables
+        initial_var_keys = set(exec_globals.keys())
+        
         with contextlib.redirect_stdout(stdout_stream), contextlib.redirect_stderr(stderr_stream):
             exec(code_str, exec_globals)
         output_queue.put(("status", task_id, "completed"))
+        
+        # Check for important variables and add them to explicit vars
+        for var in important_vars:
+            if var in exec_globals and var not in initial_var_keys:
+                explicit_vars.add(var)
+                output_queue.put(("stderr", task_id, f"[Debug] Adding important variable: {var}\n"))
+        
+        # Collect globals and send back via manager dict if provided
+        if result_dict is not None:
+            # Track only new or potentially modified variables
+            current_var_keys = set(exec_globals.keys())
+            new_or_modified_keys = current_var_keys - initial_var_keys
+            
+            # Add variables that existed before but might have been modified
+            potentially_modified = initial_var_keys - set(['__builtins__', 'contextlib', 'QueueStream', 
+                                         'QueueDisplayPublisher', 'traceback', 'cloudpickle'])
+            
+            # Variables to transfer (new + potentially modified)
+            vars_to_transfer = new_or_modified_keys.union(potentially_modified)
+            
+            # Debug log for variable tracking
+            output_queue.put(("stderr", task_id, f"[Debug] New variables: {', '.join(sorted(new_or_modified_keys)[:20])}\n"))
+            
+            # Filter out non-serializable objects before sending back
+            serializable_globals = {}
+            skipped_vars = []
+            
+            # Process explicit assignments first to make sure they are included
+            for key in explicit_vars:
+                if key in exec_globals and key not in ('__builtins__', 'contextlib', 'QueueStream', 
+                                               'QueueDisplayPublisher', 'traceback', 'cloudpickle'):
+                    value = exec_globals[key]
+                    
+                    # Special handling for simple data types that should always work
+                    if isinstance(value, (int, float, str, bool, list, dict, tuple, set)):
+                        serializable_globals[key] = value
+                        output_queue.put(("stderr", task_id, f"[Debug] Including simple variable: {key} (type: {type(value).__name__})\n"))
+                        continue
+                    
+                    try:
+                        # Test if object can be pickled with cloudpickle
+                        cloudpickle.dumps(value)
+                        serializable_globals[key] = value
+                        output_queue.put(("stderr", task_id, f"[Debug] Including explicitly assigned variable: {key}\n"))
+                    except Exception as e:
+                        skipped_vars.append(key)
+                        output_queue.put(("stderr", task_id, f"[Warning] Cannot serialize explicitly assigned variable '{key}': {str(e)[:100]}...\n"))
+            
+            # Process other variables
+            for key in vars_to_transfer:
+                # Skip explicit vars (already processed) and internal objects
+                if key in explicit_vars or key.startswith('__') or key in ('__builtins__', 'contextlib', 'QueueStream', 
+                                                 'QueueDisplayPublisher', 'traceback', 'cloudpickle'):
+                    continue
+                
+                value = exec_globals[key]
+                
+                # Skip module objects and other known unpicklable objects
+                if is_module_or_unpicklable(value):
+                    skipped_vars.append(key)
+                    continue
+                
+                # Always include simple data types and collections
+                if isinstance(value, (int, float, str, bool, list, dict, tuple, set)):
+                    serializable_globals[key] = value
+                    continue
+                
+                try:
+                    # Test if object can be pickled with cloudpickle
+                    cloudpickle.dumps(value)
+                    serializable_globals[key] = value
+                except Exception as e:
+                    # Skip non-serializable objects but record them
+                    skipped_vars.append(key)
+                    output_queue.put(("stderr", task_id, f"[Warning] Cannot serialize variable '{key}': {str(e)[:100]}...\n"))
+                    continue
+            
+            # Send serialized globals back via manager dict
+            try:
+                # Use simpler approach: directly add variables to result_dict
+                # without additional serialization/deserialization
+                success_vars = []
+                
+                for key, value in serializable_globals.items():
+                    try:
+                        # Add directly to result dict
+                        result_dict[key] = value
+                        success_vars.append(key)
+                    except Exception as e:
+                        skipped_vars.append(key)
+                        output_queue.put(("stderr", task_id, f"[Warning] Failed to transfer variable '{key}': {str(e)[:100]}...\n"))
+                
+                # Mark as completed so main process knows variables are ready
+                if success_vars:
+                    result_dict['__transfer_complete__'] = True
+                    var_count = len(success_vars)
+                    output_queue.put(("stdout", task_id, f"[Info] {var_count} variables returned to main process.\n"))
+                    
+                    if var_count > 0:
+                        output_queue.put(("stdout", task_id, f"[Info] Returned variables: {', '.join(success_vars[:20])}" + 
+                                       (f" and {len(success_vars) - 20} more" if len(success_vars) > 20 else "") + "\n"))
+                else:
+                    output_queue.put(("stderr", task_id, "[Warning] No variables could be transferred to main process.\n"))
+                
+                if skipped_vars:
+                    output_queue.put(("stderr", task_id, f"[Warning] Skipped non-transferable variables: {', '.join(skipped_vars)}\n"))
+            except Exception as e:
+                output_queue.put(("stderr", task_id, f"[Warning] Failed to process variables: {e}\n"))
 
     except Exception as e:
         tb_str = traceback.format_exc()

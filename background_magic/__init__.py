@@ -3,7 +3,7 @@ import time
 import uuid
 import threading
 import hashlib # For hashing cell content
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Manager
 import queue # Explicit import for queue.Empty
 import cloudpickle # Import cloudpickle
 from IPython.core.magic import Magics, line_magic, cell_magic, magics_class
@@ -143,6 +143,10 @@ class BackgroundMagics(Magics):
         self._task_counter = 0
         # Store the instance on the shell for unload_ipython_extension
         shell._background_magic_instance = self
+        # Dictionary to store namespaces from background processes
+        self._namespaces = {}
+        # Manager for shared dictionaries
+        self._manager = Manager()
 
     # Ensure cleanup happens when the Magics object is deleted (e.g., kernel restart)
     def __del__(self):
@@ -200,6 +204,12 @@ class BackgroundMagics(Magics):
     @cell_magic
     def background(self, line, cell):
         """Execute cell in background, stopping previous run, directing output correctly."""
+        # --- Check if a namespace was specified ---
+        namespace = None
+        if line.strip():
+            # Parse the line for a namespace name
+            namespace = line.strip()
+        
         # --- Get parent header for associating output (if kernel exists) ---
         parent_header = None
         if hasattr(self.shell, 'kernel') and self.shell.kernel:
@@ -244,6 +254,15 @@ class BackgroundMagics(Magics):
             # Add others if necessary
         }
 
+        # If we have a namespace, check if it exists and use its variables
+        if namespace and namespace in self._namespaces:
+            namespace_dict = self._namespaces[namespace]
+            for k, v in namespace_dict.items():
+                if k not in ipython_builtins_to_skip:
+                    serializable_ns[k] = v
+            print(f"[Info] Using variables from namespace '{namespace}'", file=sys.stderr)
+
+        # Add global variables
         for k, v in user_ns.items():
             # Check if key should be skipped *first*
             if (k.startswith('_') and k not in ('_', '__', '___')) or k in ipython_builtins_to_skip:
@@ -267,10 +286,8 @@ class BackgroundMagics(Magics):
             print(f"[Error] Failed to serialize the collected global context: {e}", file=sys.stderr)
             serialized_context = None # Signal to runner that context failed
 
-        # Don't print skipped keys unless necessary for debugging
-        # if skipped_keys:
-        #      print(f"[Info] Skipped non-serializable global variables: {skipped_keys}", file=sys.stderr)
-        # --- End context capture ---
+        # Create a manager dict to receive variables from the background process
+        result_dict = self._manager.dict()
 
         initial_status_html = f"<div id='{status_display_id}' style='margin-bottom: 5px;'><i>Starting [{base_id}]...</i></div>"
         display(HTML(initial_status_html), display_id=status_display_id)
@@ -286,7 +303,7 @@ class BackgroundMagics(Magics):
         process = Process(
             target=run_code_in_background,
             # Pass serialized context to the runner function
-            args=(cell, output_queue, task_id, serialized_context),
+            args=(cell, output_queue, task_id, serialized_context, result_dict),
             daemon=True
         )
         process.start()
@@ -298,9 +315,93 @@ class BackgroundMagics(Magics):
             'queue': output_queue,
             'stop_event': stop_event,
             'status_display_id': status_display_id,
-            'cell_hash': cell_content_hash # Store hash for potential reverse lookup
+            'cell_hash': cell_content_hash, # Store hash for potential reverse lookup
+            'namespace': namespace,
+            'result_dict': result_dict,
+            'transfer_complete': threading.Event()  # Add event for tracking transfer completion
         }
         self._cell_hash_to_task_id[cell_content_hash] = task_id # Map hash to new task ID
+        
+        # Start a thread to handle the transfer of variables after the process completes
+        var_transfer_thread = threading.Thread(
+            target=self._handle_variable_transfer,
+            args=(task_id,),
+            daemon=True
+        )
+        var_transfer_thread.start()
+        
+        # Block briefly to ensure short-running cells have time to transfer variables
+        # This helps with cells that finish very quickly
+        time.sleep(0.2)
+        
+        # Check if the 'res' variable is critical for this cell
+        needs_res = 'res' in cell
+        if needs_res:
+            # Wait up to 5 seconds for variable transfer to complete if it has 'res'
+            task_info = self._background_tasks.get(task_id)
+            if task_info and 'transfer_complete' in task_info:
+                task_info['transfer_complete'].wait(5.0)
+                
+            # Log warning if still waiting
+            if task_info and 'transfer_complete' in task_info and not task_info['transfer_complete'].is_set():
+                print(f"[Warning] Variable transfer may still be in progress. 'res' variable may not be available immediately.", file=sys.stderr)
+
+    def _handle_variable_transfer(self, task_id):
+        """Wait for process to complete and transfer variables."""
+        if task_id not in self._background_tasks:
+            return
+            
+        task_info = self._background_tasks[task_id]
+        process = task_info['process']
+        namespace = task_info['namespace']
+        result_dict = task_info['result_dict']
+        transfer_complete_event = task_info.get('transfer_complete')
+        
+        # Wait for process to complete with timeout
+        max_wait = 120  # Maximum wait time in seconds - increased for long-running tasks
+        start_time = time.time()
+        
+        # Check periodically for variables while the process is running
+        while process.is_alive() and time.time() - start_time < max_wait:
+            # Check if variables are already available even while process is still running
+            if '__transfer_complete__' in result_dict:
+                break
+            time.sleep(0.5)  # Increased sleep time to reduce CPU usage
+        
+        # Wait a short time after the process completes to ensure variable transfer is done
+        if not process.is_alive():
+            time.sleep(0.5)
+        
+        # Get variables from result_dict (excluding special keys)
+        transferred_vars = {k: v for k, v in result_dict.items() 
+                           if not k.startswith('__') and k != '__transfer_complete__'}
+        
+        if not transferred_vars:
+            print(f"[Warning] No variables returned from background task {task_id[:8]}", file=sys.stderr)
+            if transfer_complete_event:
+                transfer_complete_event.set()  # Mark as complete even if no variables
+            return
+            
+        # If namespace is specified, store variables in that namespace
+        if namespace:
+            if namespace not in self._namespaces:
+                self._namespaces[namespace] = {}
+            self._namespaces[namespace].update(transferred_vars)
+            print(f"[Info] Variables from background task stored in namespace '{namespace}'", file=sys.stderr)
+            var_names = list(transferred_vars.keys())
+            if var_names:
+                print(f"[Debug] Transferred variables to namespace '{namespace}': {', '.join(var_names)}", file=sys.stderr)
+        else:
+            # Update global namespace
+            self.shell.user_ns.update(transferred_vars)
+            var_names = list(transferred_vars.keys())
+            if var_names:
+                print(f"[Info] Variables from background task updated in global namespace", file=sys.stderr)
+                print(f"[Debug] Transferred variables: {', '.join(var_names)}", file=sys.stderr)
+            
+            # Signal that transfer is complete
+            if transfer_complete_event:
+                transfer_complete_event.set()
 
 
 def load_ipython_extension(ipython):
